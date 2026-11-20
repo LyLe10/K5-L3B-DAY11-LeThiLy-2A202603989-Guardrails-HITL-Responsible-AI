@@ -87,12 +87,23 @@ async def part4_attacks():
     print("CHECKPOINT 4: Red + Red Advance")
     print("=" * 60)
 
-    from agents.agent import create_red_agent_default, test_agent
+    from agents.agent import create_red_agent_default
     from agents.guards_agent import create_red_agent_advance
     from attacks.attacks import run_attacks, save_attack_results
+    from core.utils import chat_with_agent
+    from core.cp4_progress import CP4CallTimeout, run_cp4_call
 
-    red_default, red_default_runner = create_red_agent_default()
-    await test_agent(red_default, red_default_runner)
+    try:
+        red_default, red_default_runner = create_red_agent_default()
+        await run_cp4_call(
+            lambda: chat_with_agent(red_default, red_default_runner,
+                                    "What is the current savings interest rate at VinBank?"),
+            target="red_default", identifier="smoke",
+        )
+    except CP4CallTimeout:
+        raise
+    except Exception:
+        raise RuntimeError("CP4 stopped: provider smoke check failed") from None
 
     print("\n--- Attacks on Red ---")
     unsafe_results = await run_attacks(
@@ -100,7 +111,10 @@ async def part4_attacks():
     )
 
     print("\n--- Attacks on Red Advance (bonus B2 tối đa +10 nếu LEAKED; chọn 1) ---")
-    red_advance, red_advance_runner = create_red_agent_advance()
+    try:
+        red_advance, red_advance_runner = create_red_agent_advance()
+    except Exception:
+        raise RuntimeError("CP4 stopped: guardrail initialization failed") from None
     guards_results = await run_attacks(
         red_advance, red_advance_runner, target_name="red_advance"
     )

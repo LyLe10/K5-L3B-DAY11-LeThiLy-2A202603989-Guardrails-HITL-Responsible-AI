@@ -77,10 +77,12 @@ def create_red_agent_default():
 
     if red_uses_gemini():
         from google.adk.agents import llm_agent
+        from google.adk.models.google_llm import Gemini
         from google.adk import runners
+        from google.genai import types
 
         agent = llm_agent.LlmAgent(
-            model=soft,
+            model=Gemini(model=soft, retry_options=types.HttpRetryOptions(attempts=1)),
             name="red_agent_default",
             instruction=RED_DEFAULT_INSTRUCTION,
         )
