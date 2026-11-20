@@ -83,13 +83,40 @@ async def part3_assignment_suite():
 
 async def part4_attacks():
     """Checkpoint 4: attack Red, then Red Advance (bonus)."""
+    from attacks.attacks import CP4Checkpoint, ensure_no_cp4_artifacts, record_checkpoint_failure
+    from core.config import get_llm_provider, get_model_name
+    from core.cp4_progress import CP4CallTimeout
+
+    ensure_no_cp4_artifacts()
+    checkpoint = CP4Checkpoint(get_llm_provider(), get_model_name())
+    try:
+        return await _part4_attacks_with_checkpoint(checkpoint)
+    except asyncio.CancelledError:
+        if checkpoint.data["error_category"] is None:
+            record_checkpoint_failure(checkpoint, "cancelled")
+        raise
+    except CP4CallTimeout:
+        if checkpoint.data["error_category"] is None:
+            record_checkpoint_failure(checkpoint, "timeout")
+        raise
+    except OSError:
+        if checkpoint.data["error_category"] is None:
+            record_checkpoint_failure(checkpoint, "checkpoint_error")
+        raise
+    except Exception:
+        if checkpoint.data["error_category"] is None:
+            record_checkpoint_failure(checkpoint, "provider_error")
+        raise
+
+
+async def _part4_attacks_with_checkpoint(checkpoint):
     print("\n" + "=" * 60)
     print("CHECKPOINT 4: Red + Red Advance")
     print("=" * 60)
 
     from agents.agent import create_red_agent_default
     from agents.guards_agent import create_red_agent_advance
-    from attacks.attacks import run_attacks, save_attack_results
+    from attacks.attacks import run_attacks, save_attack_results, write_run_attack_json
     from core.utils import chat_with_agent
     from core.cp4_progress import CP4CallTimeout, run_cp4_call
 
@@ -107,38 +134,28 @@ async def part4_attacks():
 
     print("\n--- Attacks on Red ---")
     unsafe_results = await run_attacks(
-        red_default, red_default_runner, target_name="red_default"
+        red_default, red_default_runner, target_name="red_default", checkpoint=checkpoint, save_json=False
     )
 
     print("\n--- Attacks on Red Advance (bonus B2 tối đa +10 nếu LEAKED; chọn 1) ---")
+    checkpoint.set_target("red_advance")
     try:
         red_advance, red_advance_runner = create_red_agent_advance()
     except Exception:
         raise RuntimeError("CP4 stopped: guardrail initialization failed") from None
     guards_results = await run_attacks(
-        red_advance, red_advance_runner, target_name="red_advance"
+        red_advance, red_advance_runner, target_name="red_advance", checkpoint=checkpoint, save_json=False
     )
 
+    # A completed checkpoint precedes publication; the aggregate is the final marker.
+    checkpoint.complete()
+    write_run_attack_json(unsafe_results, target_name="red_default")
+    write_run_attack_json(guards_results, target_name="red_advance")
     save_attack_results(
         unsafe_results=unsafe_results,
         guards_results=guards_results,
         ai_attacks=None,
     )
-
-    red_leaks = sum(1 for r in unsafe_results if r.get("leaked"))
-    bonus_leaks = sum(1 for r in guards_results if r.get("leaked"))
-    print("\n" + "=" * 60)
-    print(
-        f"Red leaks (B1 tối đa +5): {red_leaks}  |  "
-        f"Red Advance leaks (B2 tối đa +10): {bonus_leaks}  "
-        "→ chọn MỘT bonus (B1 hoặc B2); grader replay"
-    )
-    from core.config import is_harder_model, provider_label
-
-    if is_harder_model():
-        print(f"Đang dùng model khó ({provider_label()}) — tuỳ chọn khi săn bonus.")
-    print("=" * 60)
-
     return {
         "red_default": unsafe_results,
         "red_advance": guards_results,

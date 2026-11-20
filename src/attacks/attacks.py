@@ -14,8 +14,14 @@ Protected data (nguồn leak):
 
 Blue (create_blue_agent) không bị tấn công ở CP4.
 """
+import asyncio
 import json
+import os
 import re
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.utils import chat_with_agent
@@ -70,6 +76,114 @@ def _safe_blocked_at(value):
     fixed.update(f"BLOCKED_OUTPUT — NeMo Guardrails output rail ({name})"
                  for name in _SAFE_RAIL_NAMES | {"unknown"})
     return value if value in fixed else "[classification detail omitted]"
+
+
+def _atomic_write_json(path, payload, *, no_clobber=False):
+    """Flush JSON before atomic replacement or exclusive publication."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp",
+                                         delete=False) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if no_clobber:
+            # An atomic hard-link fails if the destination already exists.
+            os.link(temp_path, path)
+            try:
+                temp_path.unlink()
+            except OSError:
+                print("CP4 temporary file cleanup failed.", file=sys.stderr, flush=True)
+        else:
+            os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                print("CP4 temporary file cleanup failed.", file=sys.stderr, flush=True)
+
+
+class CP4Checkpoint:
+    """A new, isolated metadata checkpoint for one CP4 execution."""
+
+    def __init__(self, provider, model, *, directory=None):
+        run_id = uuid.uuid4().hex
+        root = Path(directory) if directory is not None else _repo_root() / "outputs" / "cp4_progress"
+        self.path = root / f"{run_id}.json"
+        self.data = {"run_id": run_id, "started_at": datetime.now(timezone.utc).isoformat(),
+                     "provider": provider, "model": model, "target": "red_default",
+                     "status": "incomplete", "completed_prompts": [], "error_category": None,
+                     "stale_checkpoint_policy": "different_run_id_is_stale"}
+        self._save()
+
+    def _save(self):
+        _atomic_write_json(self.path, self.data)
+
+    def set_target(self, target):
+        if target not in {"red_default", "red_advance"}:
+            raise ValueError("Invalid CP4 checkpoint target")
+        self.data["target"] = target
+        self._save()
+
+    def record(self, row):
+        if type(row.get("id")) is not int or row["id"] < 1:
+            raise ValueError("Invalid CP4 prompt identifier")
+        allowed_layers = {None, "input_injection", "input_topic", "nemo_input_rail",
+                          "output_filter", "nemo_output_rail", "model_refuse", "leaked"}
+        layer = row.get("layer")
+        if layer not in allowed_layers:
+            layer = None
+        self.data["completed_prompts"].append({
+            "id": row["id"], "target": self.data["target"],
+            "leaked": bool(row.get("leaked")), "blocked": bool(row.get("blocked")),
+            "blocked_input": bool(row.get("blocked_input")), "layer": layer,
+            "blocked_at": _safe_blocked_at(row.get("blocked_at")),
+            "response_preview": _OMITTED_RESPONSE,
+        })
+        self._save()
+
+    def fail(self, category):
+        if category not in {"timeout", "provider_error", "nemo_error", "cancelled", "checkpoint_error"}:
+            category = "provider_error"
+        self.data["status"] = "incomplete"
+        self.data["error_category"] = category
+        self._save()
+
+    def complete(self):
+        self.data["status"] = "completed"
+        self.data["error_category"] = None
+        self._save()
+
+
+class CP4NemoError(RuntimeError):
+    """A NeMo guardrail failed while processing a prompt."""
+
+
+def record_checkpoint_failure(checkpoint, category):
+    """Report persistence failure separately without replacing the active error."""
+    try:
+        checkpoint.fail(category)
+    except Exception:
+        print("CP4 checkpoint update failed; previous checkpoint may be stale.", file=sys.stderr, flush=True)
+
+
+def ensure_no_cp4_artifacts():
+    """Do not mix this run with fixed-name artifacts from another execution."""
+    out = _repo_root() / "outputs"
+    names = ("attack_results.json", "unsafe_attack_result.json", "guards_attack_result.json")
+    existing = [f"outputs/{name}" for name in names if os.path.lexists(out / name)]
+    if existing:
+        raise RuntimeError("CP4 stopped: existing final artifacts: " + ", ".join(existing))
+    progress = out / "cp4_progress"
+    if progress.is_dir() and any(progress.glob("*.json")):
+        raise RuntimeError("CP4 stopped: prior run checkpoint requires review in outputs/cp4_progress")
+
 _MODEL_REFUSE_MARKERS = (
     "i cannot fulfill",
     "i can't fulfill",
@@ -303,6 +417,7 @@ async def run_attacks(
     *,
     save_json: bool = True,
     output_path: str | Path | None = None,
+    checkpoint: CP4Checkpoint | None = None,
 ):
     """Run adversarial prompts against the agent and collect results.
 
@@ -335,7 +450,7 @@ async def run_attacks(
                 attack["input"], response, target_name=target_name
             )
             if outcome["layer"] == "nemo_error":
-                raise RuntimeError("NeMo guardrail failed")
+                raise CP4NemoError("CP4 stopped: NeMo guardrail failed")
             # Leak classification uses the response; artifacts retain metadata only.
             err = None
             result = {
@@ -356,11 +471,25 @@ async def run_attacks(
             if outcome["leaked"]:
                 print(">>> LEAKED")
         except CP4CallTimeout:
+            if checkpoint is not None:
+                record_checkpoint_failure(checkpoint, "timeout")
+            raise
+        except asyncio.CancelledError:
+            if checkpoint is not None:
+                record_checkpoint_failure(checkpoint, "cancelled")
+            raise
+        except CP4NemoError:
+            if checkpoint is not None:
+                record_checkpoint_failure(checkpoint, "nemo_error")
             raise
         except Exception:
+            if checkpoint is not None:
+                record_checkpoint_failure(checkpoint, "provider_error")
             raise RuntimeError("CP4 stopped: provider or guardrail failure") from None
 
         results.append(result)
+        if checkpoint is not None:
+            checkpoint.record(result)
 
     print("\n" + "=" * 60)
     print(f"Total: {len(results)} attacks on {target_name}")
@@ -431,11 +560,7 @@ def write_run_attack_json(
         "model_refuse": sum(1 for r in rows if r.get("layer") == "model_refuse"),
         "results": rows,
     }
-    if out_path.exists():
-        print(f"(ghi đè file cũ) {out_path.name}")
-    out_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _atomic_write_json(out_path, payload, no_clobber=True)
     return out_path
 
 
@@ -562,9 +687,6 @@ def save_attack_results(
     """Write outputs/attack_results.json after run_attacks / Part 1."""
     out_path = Path(filepath) if filepath else _repo_root() / "outputs" / "attack_results.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        print(f"(ghi đè file cũ) {out_path.name}")
-
     unsafe = [_compact_attack_row(r) for r in (unsafe_results or [])]
     guards = [_compact_attack_row(r) for r in (guards_results or [])]
     for g in guards:
@@ -620,8 +742,5 @@ def save_attack_results(
         )
     except Exception:
         pass
-    out_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(f"\nSaved attack evidence → {out_path}")
+    _atomic_write_json(out_path, payload, no_clobber=True)
     return out_path
