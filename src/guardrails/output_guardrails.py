@@ -41,13 +41,22 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "email": r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "api_key": r"\bsk-[a-zA-Z0-9-]+",
+        "password": r"\bpassword\s*(?:is|[:=])\s*[^\s,;]+",
+        "db_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+        "phone": r"(?<!\d)0\d{9,10}(?!\d)",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
     }
+
+    # Protect the lab's configured demo values even when emitted without a label.
+    import json
+    from pathlib import Path
+    secret_path = Path(__file__).resolve().parents[2] / "data" / "protected" / "vinbank_secrets.json"
+    secrets = json.loads(secret_path.read_text(encoding="utf-8"))["secrets"]
+    for name, value in secrets.items():
+        if isinstance(value, str) and value:
+            PII_PATTERNS[f"protected_{name}"] = re.escape(value)
 
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
@@ -172,16 +181,18 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
-
-        return llm_response  # TODO: modify if needed
+        result = content_filter(response_text)
+        replacement = result["redacted"]
+        if not result["safe"]:
+            self.redacted_count += 1
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(replacement)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                replacement = "Sorry, this response cannot be provided safely."
+        if replacement != response_text:
+            llm_response.content = types.Content(role="model", parts=[types.Part.from_text(text=replacement)])
+        return llm_response
 
 
 # ============================================================

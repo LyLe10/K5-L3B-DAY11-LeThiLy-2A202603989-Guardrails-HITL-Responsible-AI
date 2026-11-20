@@ -10,6 +10,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable
+import json
+import math
+import os
+import re
+import threading
+import time
+from datetime import timezone
+from email.utils import format_datetime, parsedate_to_datetime
+import httpx
 
 from core.config import (
     get_red_model,
@@ -18,7 +27,100 @@ from core.config import (
     get_blue_provider,
     blue_client_kwargs,
     red_openai_client_kwargs,
+    OPENROUTER_BASE_URL,
+    BLUE_MODEL,
 )
+
+
+class BlueRequestBudgetExceeded(RuntimeError):
+    """A Blue runner has exhausted its HTTP request allowance."""
+
+
+def _blue_pacing_seconds():
+    raw = os.environ.get("BLUE_MIN_INTERVAL_SECONDS", "5")
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError("Invalid BLUE_MIN_INTERVAL_SECONDS") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("Invalid BLUE_MIN_INTERVAL_SECONDS")
+    return value
+
+
+def _safe_retry_after(value):
+    """Return only a valid Retry-After value, without arbitrary header text."""
+    if not value:
+        return "unavailable"
+    value = value.strip()
+    if re.fullmatch(r"[0-9]{1,10}", value):
+        return str(int(value))
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            return "unavailable"
+        return format_datetime(parsed.astimezone(timezone.utc), usegmt=True)
+    except (TypeError, ValueError, OverflowError):
+        return "unavailable"
+
+
+class _BluePacing:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_attempt = None
+
+    def wait(self, interval, clock, sleep):
+        with self.lock:
+            if self.last_attempt is not None:
+                delay = interval - (clock() - self.last_attempt)
+                if delay > 0:
+                    sleep(delay)
+            self.last_attempt = clock()
+
+
+_BLUE_PACING = _BluePacing()
+
+
+class _BlueBudget:
+    def __init__(self, limit: int = 18, min_interval: float = 5.0, *, clock=None, sleep=None, pacing=None):
+        self.limit = limit
+        self.count = 0
+        self.lock = threading.Lock()
+        self.min_interval = min_interval
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self.pacing = pacing or _BluePacing()
+
+    def acquire(self):
+        with self.lock:
+            if self.count >= self.limit:
+                raise BlueRequestBudgetExceeded("Blue HTTP request budget exhausted")
+            self.pacing.wait(self.min_interval, self.clock, self.sleep)
+            self.count += 1
+
+
+class _BlueTransport(httpx.BaseTransport):
+    """Count actual HTTP attempts, including retries, before sending anything."""
+
+    def __init__(self, budget, inner=None):
+        self.budget = budget
+        self.inner = inner if inner is not None else httpx.HTTPTransport(retries=0)
+
+    def handle_request(self, request):
+        if (request.method != "POST" or str(request.url) !=
+                "https://openrouter.ai/api/v1/chat/completions"):
+            raise RuntimeError("Blue request destination rejected")
+        try:
+            body = json.loads(request.content)
+        except (ValueError, UnicodeDecodeError):
+            raise RuntimeError("Blue request body rejected") from None
+        if body.get("model") != BLUE_MODEL or "models" in body or "route" in body:
+            raise RuntimeError("Blue model policy rejected")
+        self.budget.acquire()
+        print(f"Blue HTTP requests attempted: {self.budget.count}/{self.budget.limit}", flush=True)
+        return self.inner.handle_request(request)
+
+    def close(self):
+        self.inner.close()
 
 
 @dataclass
@@ -45,11 +147,28 @@ class OpenAIRunner:
     client_kwargs: dict = field(default_factory=dict)
     input_hooks: list[Callable[[str], str | None]] = field(default_factory=list)
     output_hooks: list[Callable[[str], str]] = field(default_factory=list)
+    _blue_client: Any = field(default=None, init=False, repr=False)
+    _blue_budget: Any = field(default=None, init=False, repr=False)
 
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        if self.provider != "openrouter":
+            return OpenAI(**(self.client_kwargs or {}))
+        if self.model != BLUE_MODEL:
+            raise RuntimeError("Blue model policy rejected")
+        if self._blue_client is None:
+            kwargs = dict(self.client_kwargs or {})
+            if kwargs.get("base_url", "").rstrip("/") != OPENROUTER_BASE_URL:
+                raise RuntimeError("Blue endpoint policy rejected")
+            if self._blue_budget is None:
+                self._blue_budget = _BlueBudget(min_interval=_blue_pacing_seconds(), pacing=_BLUE_PACING)
+            kwargs.update(max_retries=0, timeout=30.0, http_client=httpx.Client(
+                transport=_BlueTransport(self._blue_budget), follow_redirects=False,
+                timeout=httpx.Timeout(30.0, connect=5.0), trust_env=False,
+            ))
+            self._blue_client = OpenAI(**kwargs)
+        return self._blue_client
 
     async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
         for hook in self.input_hooks:
@@ -62,14 +181,40 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
+        try:
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": agent.instruction},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=self.temperature,
+            )
+        except Exception as exc:
+            if self.provider == "openrouter":
+                from openai import APIStatusError
+                allowed_names = {
+                    "APIStatusError", "InternalServerError", "RateLimitError",
+                    "BadRequestError", "AuthenticationError", "PermissionDeniedError",
+                    "NotFoundError", "ConflictError", "UnprocessableEntityError",
+                    "APIConnectionError", "APITimeoutError",
+                }
+                name = type(exc).__name__
+                name = name if name in allowed_names else "OtherError"
+                status = "unavailable"
+                retry_after = "unavailable"
+                if isinstance(exc, APIStatusError):
+                    code = getattr(exc, "status_code", None)
+                    if isinstance(code, int) and 100 <= code <= 599:
+                        status = str(code)
+                    response = getattr(exc, "response", None)
+                    if response is not None:
+                        retry_after = _safe_retry_after(response.headers.get("retry-after"))
+                raise RuntimeError(
+                    f"Blue request failed: {name}; HTTP status: {status}; "
+                    f"Retry-After: {retry_after}; HTTP attempts: {self._blue_budget.count}"
+                ) from None
+            raise
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
